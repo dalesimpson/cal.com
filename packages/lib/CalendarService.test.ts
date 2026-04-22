@@ -323,6 +323,160 @@ describe("CalendarService - SCHEDULE-AGENT injection", () => {
     });
   });
 
+  describe("UID consistency", () => {
+    it("should use event.iCalUID as the VEVENT UID when provided", async () => {
+      const service = new TestCalendarService();
+      const mockIcsOutput = `BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:placeholder\r\nDTSTART:20230101T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR`;
+      vi.mocked(createIcsEvent).mockReturnValue({
+        error: null as unknown as Error,
+        value: mockIcsOutput,
+      });
+
+      const event = createMockEvent({ iCalUID: "consistent-uid@Cal.com" });
+
+      await service.createEvent(event, 1);
+
+      // The UID passed to ics createEvent should be the iCalUID
+      const icsCallArgs = vi.mocked(createIcsEvent).mock.calls[0][0];
+      expect(icsCallArgs.uid).toBe("consistent-uid@Cal.com");
+    });
+
+    it("should fall back to a generated UUID when iCalUID is not set", async () => {
+      const service = new TestCalendarService();
+      const mockIcsOutput = `BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:placeholder\r\nDTSTART:20230101T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR`;
+      vi.mocked(createIcsEvent).mockReturnValue({
+        error: null as unknown as Error,
+        value: mockIcsOutput,
+      });
+
+      const event = createMockEvent();
+
+      await service.createEvent(event, 1);
+
+      const icsCallArgs = vi.mocked(createIcsEvent).mock.calls[0][0];
+      // Should be a UUID-like string (not undefined/null)
+      expect(icsCallArgs.uid).toBeDefined();
+      expect(typeof icsCallArgs.uid).toBe("string");
+      expect(icsCallArgs.uid!.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe("VTIMEZONE injection", () => {
+    it("should inject a VTIMEZONE block when organizer has a non-UTC timezone", async () => {
+      const service = new TestCalendarService();
+      const mockIcsOutput = `BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nDTSTART:20230101T100000Z\r\nDURATION:PT60M\r\nEND:VEVENT\r\nEND:VCALENDAR`;
+      vi.mocked(createIcsEvent).mockReturnValue({
+        error: null as unknown as Error,
+        value: mockIcsOutput,
+      });
+
+      const event = createMockEvent({
+        organizer: {
+          name: "Test",
+          email: "test@example.com",
+          timeZone: "America/Chicago",
+          language: { translate: ((key: string) => key) as never, locale: "en" },
+        },
+      });
+
+      await service.createEvent(event, 1);
+
+      const calledArg = vi.mocked(createCalendarObject).mock.calls[0][0];
+      const iCalString = calledArg.iCalString;
+
+      expect(iCalString).toContain("BEGIN:VTIMEZONE");
+      expect(iCalString).toContain("TZID:America/Chicago");
+      expect(iCalString).toContain("END:VTIMEZONE");
+    });
+
+    it("should convert DTSTART from UTC to timezone-local format with TZID", async () => {
+      const service = new TestCalendarService();
+      const mockIcsOutput = `BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nDTSTART:20230101T100000Z\r\nDURATION:PT60M\r\nEND:VEVENT\r\nEND:VCALENDAR`;
+      vi.mocked(createIcsEvent).mockReturnValue({
+        error: null as unknown as Error,
+        value: mockIcsOutput,
+      });
+
+      const event = createMockEvent({
+        organizer: {
+          name: "Test",
+          email: "test@example.com",
+          timeZone: "America/Chicago",
+          language: { translate: ((key: string) => key) as never, locale: "en" },
+        },
+      });
+
+      await service.createEvent(event, 1);
+
+      const calledArg = vi.mocked(createCalendarObject).mock.calls[0][0];
+      const iCalString = calledArg.iCalString;
+
+      // DTSTART should have TZID parameter, not bare UTC Z format
+      expect(iCalString).toContain("DTSTART;TZID=America/Chicago:");
+      expect(iCalString).not.toMatch(/DTSTART:\d{8}T\d{6}Z/);
+    });
+
+    it("should not inject VTIMEZONE when organizer timezone is UTC", async () => {
+      const service = new TestCalendarService();
+      const mockIcsOutput = `BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nDTSTART:20230101T100000Z\r\nDURATION:PT60M\r\nEND:VEVENT\r\nEND:VCALENDAR`;
+      vi.mocked(createIcsEvent).mockReturnValue({
+        error: null as unknown as Error,
+        value: mockIcsOutput,
+      });
+
+      const event = createMockEvent({
+        organizer: {
+          name: "Test",
+          email: "test@example.com",
+          timeZone: "UTC",
+          language: { translate: ((key: string) => key) as never, locale: "en" },
+        },
+      });
+
+      await service.createEvent(event, 1);
+
+      const calledArg = vi.mocked(createCalendarObject).mock.calls[0][0];
+      const iCalString = calledArg.iCalString;
+
+      expect(iCalString).not.toContain("BEGIN:VTIMEZONE");
+    });
+
+    it("should inject VTIMEZONE on updateEvent as well", async () => {
+      const service = new TestCalendarService();
+      const mockIcsOutput = `BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nDTSTART:20230101T100000Z\r\nDURATION:PT60M\r\nEND:VEVENT\r\nEND:VCALENDAR`;
+      vi.mocked(createIcsEvent).mockReturnValue({
+        error: null as unknown as Error,
+        value: mockIcsOutput,
+      });
+
+      (service as unknown as Record<string, unknown>).getEventsByUID = vi.fn().mockResolvedValue([
+        {
+          uid: "test-uid",
+          url: "https://caldav.example.com/calendar/test.ics",
+          etag: '"etag123"',
+        },
+      ]);
+
+      const event = createMockEvent({
+        uid: "test-uid",
+        organizer: {
+          name: "Test",
+          email: "test@example.com",
+          timeZone: "Europe/London",
+          language: { translate: ((key: string) => key) as never, locale: "en" },
+        },
+      });
+
+      await service.testUpdateEvent("test-uid", event, "https://caldav.example.com/calendar/");
+
+      const calledArg = vi.mocked(updateCalendarObject).mock.calls[0][0];
+      const data = calledArg.calendarObject.data;
+
+      expect(data).toContain("BEGIN:VTIMEZONE");
+      expect(data).toContain("TZID:Europe/London");
+    });
+  });
+
   describe("Edge cases", () => {
     it("should handle ATTENDEE with multiple parameters", async () => {
       const service = new TestCalendarService();

@@ -172,6 +172,53 @@ const injectScheduleAgent = (iCalString: string): string => {
   return result;
 };
 
+/**
+ * Injects a VTIMEZONE block and converts UTC date-time properties to timezone-qualified
+ * format so CalDAV servers (e.g., Fastmail) send invitations in the correct timezone.
+ */
+const injectVTimezone = (iCalString: string, timezone: string): string => {
+  if (!timezone || timezone === "UTC") return iCalString;
+
+  // Convert a UTC date-time property to timezone-local with TZID parameter
+  const convertUtcProp = (str: string, propName: string) => {
+    return str.replace(
+      new RegExp(`${propName}:(\\d{4})(\\d{2})(\\d{2})T(\\d{2})(\\d{2})(\\d{2})Z`),
+      (_match, y, m, d, h, min, s) => {
+        const utcDate = dayjs.utc(`${y}-${m}-${d}T${h}:${min}:${s}Z`);
+        const tzDate = utcDate.tz(timezone);
+        return `${propName};TZID=${timezone}:${tzDate.format("YYYYMMDDTHHmmss")}`;
+      }
+    );
+  };
+
+  let result = convertUtcProp(iCalString, "DTSTART");
+  result = convertUtcProp(result, "DTEND");
+
+  // Compute UTC offset at event start for the VTIMEZONE block
+  const dtstartMatch = iCalString.match(/DTSTART:(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z/);
+  let offset = "+0000";
+  if (dtstartMatch) {
+    const [, y, m, d, h, min, s] = dtstartMatch;
+    const utcDate = dayjs.utc(`${y}-${m}-${d}T${h}:${min}:${s}Z`);
+    offset = utcDate.tz(timezone).format("Z").replace(":", "");
+  }
+
+  const vtimezoneBlock = [
+    "BEGIN:VTIMEZONE",
+    `TZID:${timezone}`,
+    "BEGIN:STANDARD",
+    `TZOFFSETFROM:${offset}`,
+    `TZOFFSETTO:${offset}`,
+    "DTSTART:16010101T000000",
+    "END:STANDARD",
+    "END:VTIMEZONE",
+  ].join("\r\n");
+
+  result = result.replace("BEGIN:VEVENT", vtimezoneBlock + "\r\nBEGIN:VEVENT");
+
+  return result;
+};
+
 const mapAttendees = (attendees: AttendeeInCalendarEvent[] | TeamMember[]): Attendee[] =>
   attendees.map(({ email, name }) => ({ name, email, partstat: "NEEDS-ACTION" }));
 
@@ -217,7 +264,8 @@ export default abstract class BaseCalendarService implements Calendar {
   async createEvent(event: CalendarServiceEvent, credentialId: number): Promise<NewCalendarEventType> {
     try {
       const calendars = await this.listCalendars(event);
-      const uid = uuidv4();
+      const calendarObjectId = uuidv4();
+      const uid = event.iCalUID || calendarObjectId;
 
       // We create local ICS files
       const { error, value: iCalString } = createEvent({
@@ -260,8 +308,11 @@ export default abstract class BaseCalendarService implements Calendar {
               calendar: {
                 url: calendar.externalId,
               },
-              filename: `${uid}.ics`,
-              iCalString: injectScheduleAgent(iCalString),
+              filename: `${calendarObjectId}.ics`,
+              iCalString: injectVTimezone(
+                injectScheduleAgent(iCalString),
+                event.organizer.timeZone
+              ),
               headers: this.headers,
             })
           )
@@ -274,12 +325,13 @@ export default abstract class BaseCalendarService implements Calendar {
       }
 
       return {
-        uid,
-        id: uid,
+        uid: calendarObjectId,
+        id: calendarObjectId,
         type: this.integrationName,
         password: "",
         url: "",
         additionalInfo: {},
+        iCalUID: uid,
       };
     } catch (reason) {
       logger.error(reason);
@@ -296,8 +348,9 @@ export default abstract class BaseCalendarService implements Calendar {
       const events = await this.getEventsByUID(uid);
 
       /** We generate the ICS files */
+      const iCalUid = event.iCalUID || uid;
       const { error, value: iCalString } = createEvent({
-        uid,
+        uid: iCalUid,
         startInputType: "utc",
         start: convertDate(event.startTime),
         duration: getDuration(event.startTime, event.endTime),
@@ -321,14 +374,17 @@ export default abstract class BaseCalendarService implements Calendar {
         };
       }
       let calendarEvent: CalendarEventType;
-      const eventsToUpdate = events.filter((e) => e.uid === uid);
+      const eventsToUpdate = events.filter((e) => e.uid === uid || e.uid === iCalUid);
       return Promise.all(
         eventsToUpdate.map((eventItem) => {
           calendarEvent = eventItem;
           return updateCalendarObject({
             calendarObject: {
               url: calendarEvent.url,
-              data: injectScheduleAgent(iCalString ?? ""),
+              data: injectVTimezone(
+                injectScheduleAgent(iCalString ?? ""),
+                event.organizer.timeZone
+              ),
               etag: calendarEvent?.etag,
             },
             headers: this.headers,
@@ -370,9 +426,8 @@ export default abstract class BaseCalendarService implements Calendar {
     try {
       const events = await this.getEventsByUID(uid);
 
-      const eventsToDelete = events.filter((event) => event.uid === uid);
       await Promise.all(
-        eventsToDelete.map((event) => {
+        events.map((event) => {
           return deleteCalendarObject({
             calendarObject: {
               url: event.url,
