@@ -989,6 +989,85 @@ describe("getBookingResponsesSchema", () => {
     });
   });
 
+  describe("hidden email field with phone number", () => {
+    test(`should validate successfully when email is hidden and phone number is provided`, async () => {
+      const schema = getBookingResponsesSchema({
+        bookingFields: [
+          {
+            name: "name",
+            type: "name",
+            required: true,
+          },
+          {
+            name: "email",
+            type: "email",
+            required: true,
+            hidden: true,
+          },
+          {
+            name: "attendeePhoneNumber",
+            type: "phone",
+            required: true,
+          },
+        ] as z.infer<typeof eventTypeBookingFields> & z.BRAND<"HAS_SYSTEM_FIELDS">,
+        view: "ALL_VIEWS",
+      });
+      // Email is provided as a prefilled value (e.g. session email) but the field is hidden
+      const parsedResponses = await schema.safeParseAsync({
+        name: "test",
+        email: "prefilled@example.com",
+        attendeePhoneNumber: "+919999999999",
+      });
+      expect(parsedResponses.success).toBe(true);
+      if (!parsedResponses.success) {
+        throw new Error("Should not reach here");
+      }
+      // When email is hidden and phone is visible, the email is cleared to empty string
+      expect(parsedResponses.data).toEqual({
+        name: "test",
+        email: "",
+        attendeePhoneNumber: "+919999999999",
+      });
+    });
+
+    test(`should fail with email_validation_error when email is visible and invalid`, async () => {
+      const schema = getBookingResponsesSchema({
+        bookingFields: [
+          {
+            name: "name",
+            type: "name",
+            required: true,
+          },
+          {
+            name: "email",
+            type: "email",
+            required: true,
+          },
+          {
+            name: "attendeePhoneNumber",
+            type: "phone",
+            required: false,
+          },
+        ] as z.infer<typeof eventTypeBookingFields> & z.BRAND<"HAS_SYSTEM_FIELDS">,
+        view: "ALL_VIEWS",
+      });
+      const parsedResponses = await schema.safeParseAsync({
+        name: "test",
+        email: "invalid",
+      });
+      expect(parsedResponses.success).toBe(false);
+      if (parsedResponses.success) {
+        throw new Error("Should not reach here");
+      }
+      expect(parsedResponses.error.issues[0]).toEqual(
+        expect.objectContaining({
+          code: "custom",
+          message: `{email}${CUSTOM_EMAIL_VALIDATION_ERROR_MSG}`,
+        })
+      );
+    });
+  });
+
   test.todo("select");
   test.todo("textarea");
   test.todo("number");
