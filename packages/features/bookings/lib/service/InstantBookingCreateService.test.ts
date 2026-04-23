@@ -11,9 +11,13 @@ import {
   mockNoTranslations,
 } from "@calcom/testing/lib/bookingScenario/bookingScenario";
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
-import { BookingStatus } from "@calcom/prisma/enums";
+import { BookingEventHandlerService } from "@calcom/features/bookings/lib/onBookingEvents/BookingEventHandlerService";
+import { FeaturesRepository } from "@calcom/features/flags/features.repository";
+import { BookingStatus, CreationSource } from "@calcom/prisma/enums";
+
+import getOrgIdFromMemberOrTeamId from "@calcom/lib/getOrgIdFromMemberOrTeamId";
 
 import { getInstantBookingCreateService } from "../../di/InstantBookingCreateService.container";
 import type { CreateInstantBookingData } from "../dto/types";
@@ -29,6 +33,10 @@ vi.mock("@calcom/features/conferencing/lib/videoClient", () => ({
     password: "MOCK_INSTANT_PASS",
     url: "http://mock-dailyvideo.example.com/instant-meeting-url",
   }),
+}));
+
+vi.mock("@calcom/lib/getOrgIdFromMemberOrTeamId", () => ({
+  default: vi.fn(),
 }));
 
 describe("handleInstantMeeting", () => {
@@ -177,6 +185,110 @@ describe("handleInstantMeeting", () => {
           bookingData: mockBookingData,
         })
       ).rejects.toThrow("Only Team Event Types are supported for Instant Meeting");
+    });
+
+    it("should emit booking audit event when booking-audit feature is enabled", async () => {
+      const onBookingCreatedSpy = vi
+        .spyOn(BookingEventHandlerService.prototype, "onBookingCreated")
+        .mockResolvedValue(undefined);
+
+      vi.spyOn(FeaturesRepository.prototype, "checkIfTeamHasFeature").mockResolvedValue(true);
+      vi.mocked(getOrgIdFromMemberOrTeamId).mockResolvedValue(100);
+
+      const instantBookingCreateService = getInstantBookingCreateService();
+      const organizer = getOrganizer({
+        name: "Organizer",
+        email: "organizer@example.com",
+        id: 101,
+        schedules: [TestData.schedules.IstWorkHours],
+        credentials: [getGoogleCalendarCredential()],
+        selectedCalendars: [TestData.selectedCalendars.google],
+      });
+
+      const { dateString: plus1DateString } = getDate({ dateIncrement: 1 });
+
+      await createBookingScenario(
+        getScenarioData({
+          eventTypes: [
+            {
+              id: 1,
+              slotInterval: 45,
+              length: 45,
+              users: [
+                {
+                  id: 101,
+                },
+              ],
+              team: {
+                id: 1,
+              },
+              instantMeetingExpiryTimeOffsetInSeconds: 90,
+            },
+          ],
+          organizer,
+          apps: [TestData.apps["daily-video"], TestData.apps["google-calendar"]],
+        })
+      );
+
+      mockSuccessfulVideoMeetingCreation({
+        metadataLookupKey: "dailyvideo",
+        videoMeetingData: {
+          id: "MOCK_ID",
+          password: "MOCK_PASS",
+          url: `http://mock-dailyvideo.example.com/meeting-1`,
+        },
+      });
+      mockCalendarToHaveNoBusySlots("googlecalendar", {
+        create: {
+          uid: "MOCKED_GOOGLE_CALENDAR_EVENT_ID",
+        },
+      });
+
+      const mockBookingData: CreateInstantBookingData = {
+        eventTypeId: 1,
+        timeZone: "UTC",
+        language: "en",
+        start: `${plus1DateString}T04:00:00.000Z`,
+        end: `${plus1DateString}T04:45:00.000Z`,
+        responses: {
+          name: "Test User",
+          email: "test@example.com",
+          attendeePhoneNumber: "+918888888888",
+        },
+        metadata: {},
+        instant: true,
+        creationSource: CreationSource.WEBAPP,
+      };
+
+      const result = await instantBookingCreateService.createBooking({
+        bookingData: mockBookingData,
+        bookingMeta: {
+          userUuid: "test-user-uuid",
+          impersonatedByUserUuid: null,
+        },
+      });
+
+      expect(result.message).toBe("Success");
+      expect(result.bookingUid).toBeDefined();
+
+      expect(onBookingCreatedSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            config: { isDryRun: false },
+            bookingFormData: { hashedLink: null },
+            booking: expect.objectContaining({
+              uid: result.bookingUid,
+              status: BookingStatus.AWAITING_HOST,
+            }),
+            organizationId: 100,
+          }),
+          isBookingAuditEnabled: true,
+          operationId: null,
+          source: "WEBAPP",
+        })
+      );
+
+      onBookingCreatedSpy.mockRestore();
     });
   });
 });
