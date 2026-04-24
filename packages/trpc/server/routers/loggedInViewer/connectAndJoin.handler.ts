@@ -1,11 +1,14 @@
 import { sendScheduledEmailsAndSMS } from "@calcom/emails/email-manager";
+import { getBookingEventHandlerService } from "@calcom/features/bookings/di/BookingEventHandlerService.container";
 import { getCalEventResponses } from "@calcom/features/bookings/lib/getCalEventResponses";
 import { scheduleNoShowTriggers } from "@calcom/features/bookings/lib/handleNewBooking/scheduleNoShowTriggers";
+import { getFeaturesRepository } from "@calcom/features/di/containers/FeaturesRepository";
 import {
   type EventTypeBrandingData,
   getEventTypeService,
 } from "@calcom/features/eventtypes/di/EventTypeService.container";
 import { isPrismaObjOrUndefined } from "@calcom/lib/isPrismaObj";
+import logger from "@calcom/lib/logger";
 import { getTranslation } from "@calcom/i18n/server";
 import { getTimeFormatStringFromUserTimeFormat } from "@calcom/lib/timeFormat";
 import { prisma } from "@calcom/prisma";
@@ -15,6 +18,8 @@ import type { TrpcSessionUser } from "@calcom/trpc/server/types";
 import type { CalendarEvent } from "@calcom/types/Calendar";
 import { TRPCError } from "@trpc/server";
 import type { TConnectAndJoinInputSchema } from "./connectAndJoin.schema";
+
+const log = logger.getSubLogger({ prefix: ["connectAndJoin"] });
 
 type Options = {
   ctx: {
@@ -279,6 +284,28 @@ export const Handler = async ({ ctx, input }: Options) => {
     teamId: eventType?.teamId,
     orgId: user.organizationId,
   });
+
+  try {
+    const organizationId = user.organizationId;
+    const featuresRepository = getFeaturesRepository();
+    const isBookingAuditEnabled = organizationId
+      ? await featuresRepository.checkIfTeamHasFeature(organizationId, "booking-audit")
+      : false;
+
+    const bookingEventHandlerService = getBookingEventHandlerService();
+    await bookingEventHandlerService.onBookingAccepted({
+      bookingUid: updatedBooking.uid,
+      actor: { identifiedBy: "user", userUuid: user.uuid },
+      organizationId,
+      auditData: {
+        status: { old: instantMeetingToken.booking.status, new: BookingStatus.ACCEPTED },
+      },
+      source: "WEBAPP",
+      isBookingAuditEnabled,
+    });
+  } catch (error) {
+    log.error("Error emitting booking-accepted audit event", error);
+  }
 
   return { isBookingAlreadyAcceptedBySomeoneElse, meetingUrl: locationVideoCallUrl };
 };
