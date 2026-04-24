@@ -13,6 +13,8 @@ import {
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
+import { BookingEventHandlerService } from "@calcom/features/bookings/lib/onBookingEvents/BookingEventHandlerService";
+import { FeaturesRepository } from "@calcom/features/flags/features.repository";
 import { BookingStatus } from "@calcom/prisma/enums";
 
 import { getInstantBookingCreateService } from "../../di/InstantBookingCreateService.container";
@@ -29,6 +31,10 @@ vi.mock("@calcom/features/conferencing/lib/videoClient", () => ({
     password: "MOCK_INSTANT_PASS",
     url: "http://mock-dailyvideo.example.com/instant-meeting-url",
   }),
+}));
+
+vi.mock("@calcom/lib/getOrgIdFromMemberOrTeamId", () => ({
+  default: vi.fn().mockResolvedValue(100),
 }));
 
 describe("handleInstantMeeting", () => {
@@ -177,6 +183,181 @@ describe("handleInstantMeeting", () => {
           bookingData: mockBookingData,
         })
       ).rejects.toThrow("Only Team Event Types are supported for Instant Meeting");
+    });
+
+    it("should emit booking audit event when booking-audit feature flag is enabled", async () => {
+      const onBookingCreatedSpy = vi
+        .spyOn(BookingEventHandlerService.prototype, "onBookingCreated")
+        .mockResolvedValue(undefined);
+      const checkFeatureSpy = vi
+        .spyOn(FeaturesRepository.prototype, "checkIfTeamHasFeature")
+        .mockResolvedValue(true);
+
+      const instantBookingCreateService = getInstantBookingCreateService();
+      const organizer = getOrganizer({
+        name: "Organizer",
+        email: "organizer@example.com",
+        id: 101,
+        schedules: [TestData.schedules.IstWorkHours],
+        credentials: [getGoogleCalendarCredential()],
+        selectedCalendars: [TestData.selectedCalendars.google],
+      });
+
+      const { dateString: plus1DateString } = getDate({ dateIncrement: 1 });
+
+      await createBookingScenario(
+        getScenarioData({
+          eventTypes: [
+            {
+              id: 1,
+              slotInterval: 45,
+              length: 45,
+              users: [
+                {
+                  id: 101,
+                },
+              ],
+              team: {
+                id: 1,
+              },
+              instantMeetingExpiryTimeOffsetInSeconds: 90,
+            },
+          ],
+          organizer,
+          apps: [TestData.apps["daily-video"], TestData.apps["google-calendar"]],
+        })
+      );
+
+      mockSuccessfulVideoMeetingCreation({
+        metadataLookupKey: "dailyvideo",
+        videoMeetingData: {
+          id: "MOCK_ID",
+          password: "MOCK_PASS",
+          url: `http://mock-dailyvideo.example.com/meeting-1`,
+        },
+      });
+      mockCalendarToHaveNoBusySlots("googlecalendar", {
+        create: {
+          uid: "MOCKED_GOOGLE_CALENDAR_EVENT_ID",
+        },
+      });
+
+      const mockBookingData: CreateInstantBookingData = {
+        eventTypeId: 1,
+        timeZone: "UTC",
+        language: "en",
+        start: `${plus1DateString}T04:00:00.000Z`,
+        end: `${plus1DateString}T04:45:00.000Z`,
+        responses: {
+          name: "Test User",
+          email: "test@example.com",
+          attendeePhoneNumber: "+918888888888",
+        },
+        metadata: {},
+        instant: true,
+      };
+
+      const result = await instantBookingCreateService.createBooking({
+        bookingData: mockBookingData,
+      });
+
+      expect(result.message).toBe("Success");
+      expect(onBookingCreatedSpy).toHaveBeenCalledOnce();
+
+      const auditCall = onBookingCreatedSpy.mock.calls[0][0];
+      expect(auditCall.payload.booking.uid).toBe(result.bookingUid);
+      expect(auditCall.payload.booking.status).toBe(BookingStatus.AWAITING_HOST);
+      expect(auditCall.payload.config.isDryRun).toBe(false);
+      expect(auditCall.payload.organizationId).toBe(100);
+      expect(auditCall.isBookingAuditEnabled).toBe(true);
+      expect(auditCall.operationId).toBeNull();
+      expect(auditCall.auditData.status).toBe(BookingStatus.AWAITING_HOST);
+
+      onBookingCreatedSpy.mockRestore();
+      checkFeatureSpy.mockRestore();
+    });
+
+    it("should not break booking creation if audit event emission fails", async () => {
+      const onBookingCreatedSpy = vi
+        .spyOn(BookingEventHandlerService.prototype, "onBookingCreated")
+        .mockRejectedValue(new Error("Audit service unavailable"));
+      const checkFeatureSpy = vi
+        .spyOn(FeaturesRepository.prototype, "checkIfTeamHasFeature")
+        .mockResolvedValue(true);
+
+      const instantBookingCreateService = getInstantBookingCreateService();
+      const organizer = getOrganizer({
+        name: "Organizer",
+        email: "organizer@example.com",
+        id: 101,
+        schedules: [TestData.schedules.IstWorkHours],
+        credentials: [getGoogleCalendarCredential()],
+        selectedCalendars: [TestData.selectedCalendars.google],
+      });
+
+      const { dateString: plus1DateString } = getDate({ dateIncrement: 1 });
+
+      await createBookingScenario(
+        getScenarioData({
+          eventTypes: [
+            {
+              id: 1,
+              slotInterval: 45,
+              length: 45,
+              users: [
+                {
+                  id: 101,
+                },
+              ],
+              team: {
+                id: 1,
+              },
+              instantMeetingExpiryTimeOffsetInSeconds: 90,
+            },
+          ],
+          organizer,
+          apps: [TestData.apps["daily-video"], TestData.apps["google-calendar"]],
+        })
+      );
+
+      mockSuccessfulVideoMeetingCreation({
+        metadataLookupKey: "dailyvideo",
+        videoMeetingData: {
+          id: "MOCK_ID",
+          password: "MOCK_PASS",
+          url: `http://mock-dailyvideo.example.com/meeting-1`,
+        },
+      });
+      mockCalendarToHaveNoBusySlots("googlecalendar", {
+        create: {
+          uid: "MOCKED_GOOGLE_CALENDAR_EVENT_ID",
+        },
+      });
+
+      const mockBookingData: CreateInstantBookingData = {
+        eventTypeId: 1,
+        timeZone: "UTC",
+        language: "en",
+        start: `${plus1DateString}T04:00:00.000Z`,
+        end: `${plus1DateString}T04:45:00.000Z`,
+        responses: {
+          name: "Test User",
+          email: "test@example.com",
+          attendeePhoneNumber: "+918888888888",
+        },
+        metadata: {},
+        instant: true,
+      };
+
+      const result = await instantBookingCreateService.createBooking({
+        bookingData: mockBookingData,
+      });
+
+      expect(result.message).toBe("Success");
+      expect(result.bookingId).toBeDefined();
+
+      onBookingCreatedSpy.mockRestore();
+      checkFeatureSpy.mockRestore();
     });
   });
 });
