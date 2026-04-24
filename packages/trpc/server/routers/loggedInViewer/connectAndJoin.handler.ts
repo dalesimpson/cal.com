@@ -1,11 +1,14 @@
 import { sendScheduledEmailsAndSMS } from "@calcom/emails/email-manager";
+import { getBookingEventHandlerService } from "@calcom/features/bookings/di/BookingEventHandlerService.container";
 import { getCalEventResponses } from "@calcom/features/bookings/lib/getCalEventResponses";
 import { scheduleNoShowTriggers } from "@calcom/features/bookings/lib/handleNewBooking/scheduleNoShowTriggers";
+import { getFeaturesRepository } from "@calcom/features/di/containers/FeaturesRepository";
 import {
   type EventTypeBrandingData,
   getEventTypeService,
 } from "@calcom/features/eventtypes/di/EventTypeService.container";
 import { isPrismaObjOrUndefined } from "@calcom/lib/isPrismaObj";
+import logger from "@calcom/lib/logger";
 import { getTranslation } from "@calcom/i18n/server";
 import { getTimeFormatStringFromUserTimeFormat } from "@calcom/lib/timeFormat";
 import { prisma } from "@calcom/prisma";
@@ -88,6 +91,8 @@ export const Handler = async ({ ctx, input }: Options) => {
   if (instantMeetingToken.expires < new Date()) {
     throw new TRPCError({ code: "BAD_REQUEST", message: "token_invalid_expired" });
   }
+
+  const oldBookingStatus = instantMeetingToken.booking.status as BookingStatus;
 
   // Check if Booking is already accepted by any other user
   let isBookingAlreadyAcceptedBySomeoneElse = false;
@@ -279,6 +284,26 @@ export const Handler = async ({ ctx, input }: Options) => {
     teamId: eventType?.teamId,
     orgId: user.organizationId,
   });
+
+  try {
+    const organizationId = user.organizationId;
+    const isBookingAuditEnabled = organizationId
+      ? await getFeaturesRepository().checkIfTeamHasFeature(organizationId, "booking-audit")
+      : false;
+
+    await getBookingEventHandlerService().onBookingAccepted({
+      bookingUid: updatedBooking.uid,
+      actor: { identifiedBy: "user", userUuid: user.uuid },
+      organizationId,
+      auditData: {
+        status: { old: oldBookingStatus, new: BookingStatus.ACCEPTED },
+      },
+      source: "WEBAPP",
+      isBookingAuditEnabled,
+    });
+  } catch (error) {
+    logger.error("Error emitting booking-accepted audit event for instant meeting", error);
+  }
 
   return { isBookingAlreadyAcceptedBySomeoneElse, meetingUrl: locationVideoCallUrl };
 };
