@@ -1,0 +1,29 @@
+diff --git a/packages/features/booking-audit/lib/actions/CreatedAuditActionService.ts b/packages/features/booking-audit/lib/actions/CreatedAuditActionService.ts
+index 83106534f2..5aee1b2b38 100644
+--- a/packages/features/booking-audit/lib/actions/CreatedAuditActionService.ts
++++ b/packages/features/booking-audit/lib/actions/CreatedAuditActionService.ts
+@@ -80,8 +80,11 @@ export class CreatedAuditActionService implements IAuditActionService {
+ 
+   async getDisplayTitle({ storedData, dbStore }: GetDisplayTitleParams): Promise<TranslationWithParams> {
+     const { fields } = this.parseStored(storedData);
++    if (fields.status === BookingStatus.AWAITING_HOST) {
++      return { key: "booking_audit_action.created_awaiting_host", params: {} };
++    }
+     const hostUser = fields.hostUserUuid ? dbStore.getUserByUuid(fields.hostUserUuid) : null;
+-    const hostName = hostUser?.name || "Unknown";
++    const hostName = hostUser?.name ?? "Unknown";
+     if (fields.seatReferenceUid) {
+       return { key: "booking_audit_action.created_with_seat", params: { host: hostName } };
+     }
+diff --git a/packages/i18n/locales/en/common.json b/packages/i18n/locales/en/common.json
+index ef962e5377..1d7925e9b1 100644
+--- a/packages/i18n/locales/en/common.json
++++ b/packages/i18n/locales/en/common.json
+@@ -4568,6 +4568,7 @@
+   "location_applied_to_hosts_other": "Location applied to {{count}} hosts",
+   "booking_audit_action": {
+     "created": "Booked with {{host}}",
++    "created_awaiting_host": "Booking created while awaiting host",
+     "created_with_seat": "Seat Booked with {{host}}",
+     "cancelled": "Cancelled",
+     "rescheduled": "Rescheduled {{oldDate}} -> <0>{{newDate}}</0>",
