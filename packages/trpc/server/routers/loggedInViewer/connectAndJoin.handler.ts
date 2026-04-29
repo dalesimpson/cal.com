@@ -1,11 +1,17 @@
 import { sendScheduledEmailsAndSMS } from "@calcom/emails/email-manager";
+import { getBookingEventHandlerService } from "@calcom/features/bookings/di/BookingEventHandlerService.container";
 import { getCalEventResponses } from "@calcom/features/bookings/lib/getCalEventResponses";
 import { scheduleNoShowTriggers } from "@calcom/features/bookings/lib/handleNewBooking/scheduleNoShowTriggers";
+import { getFeaturesRepository } from "@calcom/features/di/containers/FeaturesRepository";
 import {
   type EventTypeBrandingData,
   getEventTypeService,
 } from "@calcom/features/eventtypes/di/EventTypeService.container";
+import getOrgIdFromMemberOrTeamId from "@calcom/lib/getOrgIdFromMemberOrTeamId";
+import { getTeamIdFromEventType } from "@calcom/lib/getTeamIdFromEventType";
 import { isPrismaObjOrUndefined } from "@calcom/lib/isPrismaObj";
+import logger from "@calcom/lib/logger";
+import { safeStringify } from "@calcom/lib/safeStringify";
 import { getTranslation } from "@calcom/i18n/server";
 import { getTimeFormatStringFromUserTimeFormat } from "@calcom/lib/timeFormat";
 import { prisma } from "@calcom/prisma";
@@ -16,12 +22,58 @@ import type { CalendarEvent } from "@calcom/types/Calendar";
 import { TRPCError } from "@trpc/server";
 import type { TConnectAndJoinInputSchema } from "./connectAndJoin.schema";
 
+const log = logger.getSubLogger({ prefix: ["connectAndJoin"] });
+
 type Options = {
   ctx: {
     user: NonNullable<TrpcSessionUser>;
   };
   input: TConnectAndJoinInputSchema;
 };
+
+async function fireBookingAcceptedAuditEvent({
+  bookingUid,
+  oldStatus,
+  userUuid,
+  eventType,
+  userId,
+}: {
+  bookingUid: string;
+  oldStatus: BookingStatus;
+  userUuid: string;
+  eventType: { teamId?: number | null; parentId?: number | null } | null;
+  userId: number;
+}) {
+  try {
+    const teamId = await getTeamIdFromEventType({
+      eventType: {
+        team: { id: eventType?.teamId ?? null },
+        parentId: eventType?.parentId ?? null,
+      },
+    });
+
+    const orgId = await getOrgIdFromMemberOrTeamId({ memberId: userId, teamId });
+
+    const featuresRepository = getFeaturesRepository();
+    const isBookingAuditEnabled = orgId
+      ? await featuresRepository.checkIfTeamHasFeature(orgId, "booking-audit")
+      : false;
+
+    const bookingEventHandlerService = getBookingEventHandlerService();
+    await bookingEventHandlerService.onBookingAccepted({
+      bookingUid,
+      actor: { identifiedBy: "user", userUuid },
+      organizationId: orgId ?? null,
+      auditData: {
+        status: { old: oldStatus, new: BookingStatus.ACCEPTED },
+      },
+      source: "WEBAPP",
+      isBookingAuditEnabled,
+    });
+  } catch (error) {
+    log.error("Error firing booking accepted audit event", safeStringify(error));
+  }
+}
 
 export const Handler = async ({ ctx, input }: Options) => {
   const { token } = input;
@@ -161,6 +213,14 @@ export const Handler = async ({ ctx, input }: Options) => {
       uid: true,
       status: true,
     },
+  });
+
+  await fireBookingAcceptedAuditEvent({
+    bookingUid: updatedBooking.uid,
+    oldStatus: instantMeetingToken.booking.status,
+    userUuid: user.uuid,
+    eventType: updatedBooking.eventType,
+    userId: user.id,
   });
 
   const locationVideoCallUrl = bookingMetadataSchema.parse(updatedBooking.metadata || {})?.videoCallUrl;
