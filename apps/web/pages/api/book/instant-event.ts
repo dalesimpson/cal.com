@@ -19,6 +19,10 @@ async function handler(req: NextApiRequest & { userId?: number }) {
   const session = await getServerSession({ req });
   req.userId = session?.user?.id || -1;
   req.body.creationSource = CreationSource.WEBAPP;
+  req.body.metadata = {
+    ...req.body.metadata,
+    userUuid: session?.user?.uuid ?? null,
+  };
 
   const instantBookingService = getInstantBookingCreateService();
   // Even though req.body is any type, createBooking validates the schema on run-time.
