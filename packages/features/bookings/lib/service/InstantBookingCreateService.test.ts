@@ -13,10 +13,11 @@ import {
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-import { BookingStatus } from "@calcom/prisma/enums";
+import { BookingStatus, CreationSource } from "@calcom/prisma/enums";
 
 import { getInstantBookingCreateService } from "../../di/InstantBookingCreateService.container";
 import type { CreateInstantBookingData } from "../dto/types";
+import { InstantBookingCreateService } from "./InstantBookingCreateService";
 
 vi.mock("@calcom/features/notifications/sendNotification", () => ({
   sendNotification: vi.fn(),
@@ -177,6 +178,115 @@ describe("handleInstantMeeting", () => {
           bookingData: mockBookingData,
         })
       ).rejects.toThrow("Only Team Event Types are supported for Instant Meeting");
+    });
+  });
+
+  describe("onBookingCreated audit integration", () => {
+    async function setupTeamEventScenario() {
+      const organizer = getOrganizer({
+        name: "Organizer",
+        email: "organizer@example.com",
+        id: 101,
+        schedules: [TestData.schedules.IstWorkHours],
+        credentials: [getGoogleCalendarCredential()],
+        selectedCalendars: [TestData.selectedCalendars.google],
+      });
+
+      const { dateString: plus1DateString } = getDate({ dateIncrement: 1 });
+
+      await createBookingScenario(
+        getScenarioData({
+          eventTypes: [
+            {
+              id: 1,
+              slotInterval: 45,
+              length: 45,
+              users: [{ id: 101 }],
+              team: { id: 1 },
+              instantMeetingExpiryTimeOffsetInSeconds: 90,
+            },
+          ],
+          organizer,
+          apps: [TestData.apps["daily-video"], TestData.apps["google-calendar"]],
+        })
+      );
+
+      mockSuccessfulVideoMeetingCreation({
+        metadataLookupKey: "dailyvideo",
+        videoMeetingData: {
+          id: "MOCK_ID",
+          password: "MOCK_PASS",
+          url: `http://mock-dailyvideo.example.com/meeting-1`,
+        },
+      });
+      mockCalendarToHaveNoBusySlots("googlecalendar", {
+        create: { uid: "MOCKED_GOOGLE_CALENDAR_EVENT_ID" },
+      });
+
+      const mockBookingData: CreateInstantBookingData = {
+        eventTypeId: 1,
+        timeZone: "UTC",
+        language: "en",
+        start: `${plus1DateString}T04:00:00.000Z`,
+        end: `${plus1DateString}T04:45:00.000Z`,
+        responses: {
+          name: "Test User",
+          email: "test@example.com",
+          attendeePhoneNumber: "+918888888888",
+        },
+        metadata: {},
+        instant: true,
+        creationSource: CreationSource.WEBAPP,
+      };
+
+      return mockBookingData;
+    }
+
+    it("should call onBookingCreated after booking is persisted", async () => {
+      const mockBookingData = await setupTeamEventScenario();
+
+      const mockOnBookingCreated = vi.fn().mockResolvedValue(undefined);
+      const service = new InstantBookingCreateService({
+        prismaClient: prismock,
+        bookingEventHandler: { onBookingCreated: mockOnBookingCreated } as any,
+        featuresRepository: { checkIfTeamHasFeature: vi.fn().mockResolvedValue(true) } as any,
+      });
+
+      const result = await service.createBooking({
+        bookingData: mockBookingData,
+        bookingMeta: { userUuid: "test-user-uuid" },
+      });
+
+      expect(result.message).toBe("Success");
+      expect(result.bookingId).toBeDefined();
+      expect(mockOnBookingCreated).toHaveBeenCalledOnce();
+      const call = mockOnBookingCreated.mock.calls[0][0];
+      expect(call.payload.booking.uid).toBe(result.bookingUid);
+      expect(call.payload.booking.status).toBe(BookingStatus.AWAITING_HOST);
+      expect(call.payload.config.isDryRun).toBe(false);
+      expect(call.source).toBe("WEBAPP");
+      expect(call.actor).toEqual({ identifiedBy: "user", userUuid: "test-user-uuid" });
+      expect(call.isBookingAuditEnabled).toBe(false);
+    });
+
+    it("should still succeed when onBookingCreated rejects", async () => {
+      const mockBookingData = await setupTeamEventScenario();
+
+      const mockOnBookingCreated = vi.fn().mockRejectedValue(new Error("Audit service unavailable"));
+      const service = new InstantBookingCreateService({
+        prismaClient: prismock,
+        bookingEventHandler: { onBookingCreated: mockOnBookingCreated } as any,
+        featuresRepository: { checkIfTeamHasFeature: vi.fn().mockResolvedValue(false) } as any,
+      });
+
+      const result = await service.createBooking({
+        bookingData: mockBookingData,
+        bookingMeta: { userUuid: "test-user-uuid" },
+      });
+
+      expect(result.message).toBe("Success");
+      expect(result.bookingId).toBeDefined();
+      expect(mockOnBookingCreated).toHaveBeenCalledOnce();
     });
   });
 });
