@@ -13,7 +13,12 @@ import { getBookingData } from "@calcom/features/bookings/lib/handleNewBooking/g
 import { getCustomInputsResponses } from "@calcom/features/bookings/lib/handleNewBooking/getCustomInputsResponses";
 import { getEventTypesFromDB } from "@calcom/features/bookings/lib/handleNewBooking/getEventTypesFromDB";
 import type { IBookingCreateService } from "@calcom/features/bookings/lib/interfaces/IBookingCreateService";
+import type { BookingEventHandlerService } from "@calcom/features/bookings/lib/onBookingEvents/BookingEventHandlerService";
+import type { BookingCreatedPayload } from "@calcom/features/bookings/lib/onBookingEvents/types";
+import type { Actor } from "@calcom/features/booking-audit/lib/dto/types";
+import type { ActionSource } from "@calcom/features/booking-audit/lib/types/actionSource";
 import { createInstantMeetingWithCalVideo } from "@calcom/features/conferencing/lib/videoClient";
+import type { FeaturesRepository } from "@calcom/features/flags/features.repository";
 import { getFullName } from "@calcom/features/form-builder/utils";
 import { sendNotification } from "@calcom/features/notifications/sendNotification";
 import { sendGenericWebhookPayload } from "@calcom/features/webhooks/lib/sendPayload";
@@ -31,6 +36,8 @@ import { WebhookVersion } from "../../../webhooks/lib/interface/IWebhookReposito
 
 interface IInstantBookingCreateServiceDependencies {
   prismaClient: PrismaClient;
+  bookingEventHandler: BookingEventHandlerService;
+  featuresRepository: FeaturesRepository;
 }
 
 const handleInstantMeetingWebhookTrigger = async (args: {
@@ -342,6 +349,52 @@ export async function handler(
     teamId: eventType.team?.id,
     prismaClient: prisma,
   });
+
+  try {
+    const isBookingAuditEnabled = await deps.featuresRepository.checkIfFeatureIsEnabledGlobally(
+      "booking-audit"
+    );
+
+    const bookingCreatedPayload: BookingCreatedPayload = {
+      config: { isDryRun: false },
+      bookingFormData: { hashedLink: null },
+      booking: {
+        uid: newBooking.uid,
+        startTime: newBooking.startTime,
+        endTime: newBooking.endTime,
+        status: BookingStatus.AWAITING_HOST,
+        userId: newBooking.userId,
+      },
+      organizationId: eventType.team?.parentId ?? null,
+    };
+
+    const actor: Actor = {
+      identifiedBy: "guest",
+      email: bookerEmail,
+      name: fullName,
+    };
+
+    const auditData = {
+      startTime: newBooking.startTime.getTime(),
+      endTime: newBooking.endTime.getTime(),
+      status: BookingStatus.AWAITING_HOST,
+      hostUserUuid: null,
+      seatReferenceUid: null,
+    };
+
+    const actionSource: ActionSource = "WEBAPP";
+
+    await deps.bookingEventHandler.onBookingCreated({
+      payload: bookingCreatedPayload,
+      actor,
+      auditData,
+      source: actionSource,
+      operationId: null,
+      isBookingAuditEnabled,
+    });
+  } catch (error) {
+    logger.error("Error while emitting booking created audit event for instant booking", error);
+  }
 
   return {
     message: "Success",
