@@ -1,6 +1,8 @@
 import { sendScheduledEmailsAndSMS } from "@calcom/emails/email-manager";
+import { getBookingEventHandlerService } from "@calcom/features/bookings/di/BookingEventHandlerService.container";
 import { getCalEventResponses } from "@calcom/features/bookings/lib/getCalEventResponses";
 import { scheduleNoShowTriggers } from "@calcom/features/bookings/lib/handleNewBooking/scheduleNoShowTriggers";
+import { getFeaturesRepository } from "@calcom/features/di/containers/FeaturesRepository";
 import {
   type EventTypeBrandingData,
   getEventTypeService,
@@ -22,6 +24,39 @@ type Options = {
   };
   input: TConnectAndJoinInputSchema;
 };
+
+export async function fireBookingAcceptedAuditEvent({
+  bookingUid,
+  oldStatus,
+  userUuid,
+  organizationId,
+}: {
+  bookingUid: string;
+  oldStatus: BookingStatus;
+  userUuid: string;
+  organizationId: number | null;
+}): Promise<void> {
+  try {
+    const featuresRepository = getFeaturesRepository();
+    const isBookingAuditEnabled = organizationId
+      ? await featuresRepository.checkIfTeamHasFeature(organizationId, "booking-audit")
+      : false;
+
+    const bookingEventHandlerService = getBookingEventHandlerService();
+    await bookingEventHandlerService.onBookingAccepted({
+      bookingUid,
+      actor: { identifiedBy: "user", userUuid },
+      organizationId,
+      auditData: {
+        status: { old: oldStatus, new: BookingStatus.ACCEPTED },
+      },
+      source: "WEBAPP",
+      isBookingAuditEnabled,
+    });
+  } catch {
+    // Audit failures must not break the joining flow
+  }
+}
 
 export const Handler = async ({ ctx, input }: Options) => {
   const { token } = input;
@@ -161,6 +196,13 @@ export const Handler = async ({ ctx, input }: Options) => {
       uid: true,
       status: true,
     },
+  });
+
+  await fireBookingAcceptedAuditEvent({
+    bookingUid: updatedBooking.uid,
+    oldStatus: instantMeetingToken.booking.status,
+    userUuid: user.uuid,
+    organizationId: user.organizationId ?? null,
   });
 
   const locationVideoCallUrl = bookingMetadataSchema.parse(updatedBooking.metadata || {})?.videoCallUrl;
