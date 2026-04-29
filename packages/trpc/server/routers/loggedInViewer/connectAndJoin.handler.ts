@@ -1,6 +1,8 @@
 import { sendScheduledEmailsAndSMS } from "@calcom/emails/email-manager";
+import { getBookingEventHandlerService } from "@calcom/features/bookings/di/BookingEventHandlerService.container";
 import { getCalEventResponses } from "@calcom/features/bookings/lib/getCalEventResponses";
 import { scheduleNoShowTriggers } from "@calcom/features/bookings/lib/handleNewBooking/scheduleNoShowTriggers";
+import { getFeaturesRepository } from "@calcom/features/di/containers/FeaturesRepository";
 import {
   type EventTypeBrandingData,
   getEventTypeService,
@@ -88,6 +90,8 @@ export const Handler = async ({ ctx, input }: Options) => {
   if (instantMeetingToken.expires < new Date()) {
     throw new TRPCError({ code: "BAD_REQUEST", message: "token_invalid_expired" });
   }
+
+  const oldBookingStatus = instantMeetingToken.booking.status;
 
   // Check if Booking is already accepted by any other user
   let isBookingAlreadyAcceptedBySomeoneElse = false;
@@ -279,6 +283,27 @@ export const Handler = async ({ ctx, input }: Options) => {
     teamId: eventType?.teamId,
     orgId: user.organizationId,
   });
+
+  try {
+    const featuresRepository = getFeaturesRepository();
+    const isBookingAuditEnabled = user.organizationId
+      ? await featuresRepository.checkIfTeamHasFeature(user.organizationId, "booking-audit")
+      : false;
+
+    const bookingEventHandlerService = getBookingEventHandlerService();
+    await bookingEventHandlerService.onBookingAccepted({
+      bookingUid: updatedBooking.uid,
+      actor: { identifiedBy: "user" as const, userUuid: user.uuid },
+      organizationId: user.organizationId ?? null,
+      auditData: {
+        status: { old: oldBookingStatus, new: BookingStatus.ACCEPTED },
+      },
+      source: "WEBAPP",
+      isBookingAuditEnabled,
+    });
+  } catch {
+    // Audit failures must never break the acceptance flow
+  }
 
   return { isBookingAlreadyAcceptedBySomeoneElse, meetingUrl: locationVideoCallUrl };
 };
