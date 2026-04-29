@@ -12,8 +12,14 @@ import { getBookingFieldsWithSystemFields } from "@calcom/features/bookings/lib/
 import { getBookingData } from "@calcom/features/bookings/lib/handleNewBooking/getBookingData";
 import { getCustomInputsResponses } from "@calcom/features/bookings/lib/handleNewBooking/getCustomInputsResponses";
 import { getEventTypesFromDB } from "@calcom/features/bookings/lib/handleNewBooking/getEventTypesFromDB";
+import type { ActionSource } from "@calcom/features/booking-audit/lib/types/actionSource";
 import type { IBookingCreateService } from "@calcom/features/bookings/lib/interfaces/IBookingCreateService";
+import { buildBookingCreatedAuditData } from "@calcom/features/bookings/lib/handleNewBooking/buildBookingEventAuditData";
+import { getAuditActionSource } from "@calcom/features/bookings/lib/handleNewBooking/getAuditActionSource";
+import { getBookingAuditActorForNewBooking } from "@calcom/features/bookings/lib/handleNewBooking/getBookingAuditActorForNewBooking";
+import type { BookingEventHandlerService } from "@calcom/features/bookings/lib/onBookingEvents/BookingEventHandlerService";
 import { createInstantMeetingWithCalVideo } from "@calcom/features/conferencing/lib/videoClient";
+import type { FeaturesRepository } from "@calcom/features/flags/features.repository";
 import { getFullName } from "@calcom/features/form-builder/utils";
 import { sendNotification } from "@calcom/features/notifications/sendNotification";
 import { sendGenericWebhookPayload } from "@calcom/features/webhooks/lib/sendPayload";
@@ -26,11 +32,14 @@ import type { PrismaClient } from "@calcom/prisma";
 import { Prisma } from "@calcom/prisma/client";
 import { BookingStatus, WebhookTriggerEvents } from "@calcom/prisma/enums";
 
+import type { CreateBookingMeta } from "../dto/types";
 import { instantMeetingSubscriptionSchema as subscriptionSchema } from "../dto/schema";
 import { WebhookVersion } from "../../../webhooks/lib/interface/IWebhookRepository";
 
 interface IInstantBookingCreateServiceDependencies {
   prismaClient: PrismaClient;
+  bookingEventHandler: BookingEventHandlerService;
+  featuresRepository: FeaturesRepository;
 }
 
 const handleInstantMeetingWebhookTrigger = async (args: {
@@ -166,9 +175,87 @@ const triggerBrowserNotifications = async (args: {
   await Promise.allSettled(promises);
 };
 
+async function fireBookingEvents({
+  booking,
+  bookerEmail,
+  bookerName,
+  actorUserUuid,
+  impersonatedByUserUuid,
+  creationSource,
+  eventTypeId,
+  teamId,
+  deps,
+}: {
+  booking: { id: number; uid: string; startTime: Date; endTime: Date; status: BookingStatus; userId: number | null; attendees: Array<{ id: number; email: string }> };
+  bookerEmail: string;
+  bookerName: string;
+  actorUserUuid: string | null;
+  impersonatedByUserUuid: string | null;
+  creationSource: string | null | undefined;
+  eventTypeId: number;
+  teamId: number;
+  deps: IInstantBookingCreateServiceDependencies;
+}) {
+  try {
+    const orgId = (await getOrgIdFromMemberOrTeamId({ teamId })) ?? null;
+
+    const isBookingAuditEnabled = orgId
+      ? await deps.featuresRepository.checkIfTeamHasFeature(orgId, "booking-audit")
+      : false;
+
+    const actionSource: ActionSource = getAuditActionSource({
+      creationSource: creationSource as Parameters<typeof getAuditActionSource>[0]["creationSource"],
+      eventTypeId,
+      rescheduleUid: null,
+    });
+
+    const bookerAttendeeId = booking.attendees?.find((a) => a.email === bookerEmail)?.id ?? null;
+    const auditActor = getBookingAuditActorForNewBooking({
+      bookerAttendeeId,
+      actorUserUuid,
+      bookerEmail,
+      bookerName,
+      rescheduledBy: null,
+      logger,
+    });
+
+    const auditContext = impersonatedByUserUuid ? { impersonatedBy: impersonatedByUserUuid } : undefined;
+
+    await deps.bookingEventHandler.onBookingCreated({
+      payload: {
+        config: { isDryRun: false },
+        bookingFormData: { hashedLink: null },
+        booking: {
+          id: booking.id,
+          uid: booking.uid,
+          startTime: booking.startTime,
+          endTime: booking.endTime,
+          status: booking.status,
+          userId: booking.userId,
+          userUuid: null,
+          user: booking.userId ? { id: booking.userId } : undefined,
+        },
+        organizationId: orgId,
+      },
+      actor: auditActor,
+      auditData: buildBookingCreatedAuditData({
+        booking: { ...booking, userUuid: null },
+        attendeeSeatId: null,
+      }),
+      source: actionSource,
+      operationId: null,
+      context: auditContext,
+      isBookingAuditEnabled,
+    });
+  } catch (error) {
+    logger.error("Error while firing instant booking events", error);
+  }
+}
+
 export async function handler(
   bookingData: CreateInstantBookingData,
-  deps: IInstantBookingCreateServiceDependencies
+  deps: IInstantBookingCreateServiceDependencies,
+  bookingMeta?: Pick<CreateBookingMeta, "userUuid" | "impersonatedByUserUuid">
 ) {
   // TODO: In a followup PR, we aim to remove prisma dependency and instead inject the repositories as dependencies.
   const { prismaClient: prisma } = deps;
@@ -343,6 +430,18 @@ export async function handler(
     prismaClient: prisma,
   });
 
+  await fireBookingEvents({
+    booking: newBooking,
+    bookerEmail,
+    bookerName: fullName,
+    actorUserUuid: bookingMeta?.userUuid ?? null,
+    impersonatedByUserUuid: bookingMeta?.impersonatedByUserUuid ?? null,
+    creationSource: bookingData.creationSource,
+    eventTypeId: bookingData.eventTypeId,
+    teamId: eventType.team.id,
+    deps,
+  });
+
   return {
     message: "Success",
     meetingTokenId: instantMeetingToken.id,
@@ -359,7 +458,10 @@ export async function handler(
 export class InstantBookingCreateService implements IBookingCreateService {
   constructor(private readonly deps: IInstantBookingCreateServiceDependencies) {}
 
-  async createBooking(input: { bookingData: CreateInstantBookingData }): Promise<InstantBookingCreateResult> {
-    return handler(input.bookingData, this.deps);
+  async createBooking(input: {
+    bookingData: CreateInstantBookingData;
+    bookingMeta?: Pick<CreateBookingMeta, "userUuid" | "impersonatedByUserUuid">;
+  }): Promise<InstantBookingCreateResult> {
+    return handler(input.bookingData, this.deps, input.bookingMeta);
   }
 }
