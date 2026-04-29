@@ -1,12 +1,16 @@
 import { sendScheduledEmailsAndSMS } from "@calcom/emails/email-manager";
+import { getBookingEventHandlerService } from "@calcom/features/bookings/di/BookingEventHandlerService.container";
 import { getCalEventResponses } from "@calcom/features/bookings/lib/getCalEventResponses";
 import { scheduleNoShowTriggers } from "@calcom/features/bookings/lib/handleNewBooking/scheduleNoShowTriggers";
+import { getFeaturesRepository } from "@calcom/features/di/containers/FeaturesRepository";
 import {
   type EventTypeBrandingData,
   getEventTypeService,
 } from "@calcom/features/eventtypes/di/EventTypeService.container";
 import { isPrismaObjOrUndefined } from "@calcom/lib/isPrismaObj";
+import { safeStringify } from "@calcom/lib/safeStringify";
 import { getTranslation } from "@calcom/i18n/server";
+import logger from "@calcom/lib/logger";
 import { getTimeFormatStringFromUserTimeFormat } from "@calcom/lib/timeFormat";
 import { prisma } from "@calcom/prisma";
 import { BookingStatus } from "@calcom/prisma/enums";
@@ -279,6 +283,30 @@ export const Handler = async ({ ctx, input }: Options) => {
     teamId: eventType?.teamId,
     orgId: user.organizationId,
   });
+
+  const oldBookingStatus = instantMeetingToken.booking.status;
+
+  try {
+    const featuresRepository = getFeaturesRepository();
+    const orgId = user.organizationId;
+    const isBookingAuditEnabled = orgId
+      ? await featuresRepository.checkIfTeamHasFeature(orgId, "booking-audit")
+      : false;
+
+    const bookingEventHandlerService = getBookingEventHandlerService();
+    await bookingEventHandlerService.onBookingAccepted({
+      bookingUid: updatedBooking.uid,
+      actor: { identifiedBy: "user", userUuid: user.uuid },
+      organizationId: orgId ?? null,
+      auditData: {
+        status: { old: oldBookingStatus, new: BookingStatus.ACCEPTED },
+      },
+      source: "WEBAPP",
+      isBookingAuditEnabled,
+    });
+  } catch (error) {
+    logger.error("Error firing booking accepted audit event in connectAndJoin", safeStringify(error));
+  }
 
   return { isBookingAlreadyAcceptedBySomeoneElse, meetingUrl: locationVideoCallUrl };
 };
