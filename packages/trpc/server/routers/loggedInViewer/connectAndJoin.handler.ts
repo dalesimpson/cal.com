@@ -1,6 +1,9 @@
 import { sendScheduledEmailsAndSMS } from "@calcom/emails/email-manager";
+import { makeUserActor } from "@calcom/features/booking-audit/lib/makeActor";
+import { getBookingEventHandlerService } from "@calcom/features/bookings/di/BookingEventHandlerService.container";
 import { getCalEventResponses } from "@calcom/features/bookings/lib/getCalEventResponses";
 import { scheduleNoShowTriggers } from "@calcom/features/bookings/lib/handleNewBooking/scheduleNoShowTriggers";
+import { getFeaturesRepository } from "@calcom/features/di/containers/FeaturesRepository";
 import {
   type EventTypeBrandingData,
   getEventTypeService,
@@ -90,6 +93,7 @@ export const Handler = async ({ ctx, input }: Options) => {
   }
 
   // Check if Booking is already accepted by any other user
+  const oldBookingStatus = instantMeetingToken.booking.status as BookingStatus;
   let isBookingAlreadyAcceptedBySomeoneElse = false;
   if (
     instantMeetingToken.booking.status === BookingStatus.ACCEPTED &&
@@ -162,6 +166,27 @@ export const Handler = async ({ ctx, input }: Options) => {
       status: true,
     },
   });
+
+  try {
+    const featuresRepository = getFeaturesRepository();
+    const isBookingAuditEnabled = user.organizationId
+      ? await featuresRepository.checkIfTeamHasFeature(user.organizationId, "booking-audit")
+      : false;
+
+    const bookingEventHandlerService = getBookingEventHandlerService();
+    await bookingEventHandlerService.onBookingAccepted({
+      bookingUid: updatedBooking.uid,
+      actor: makeUserActor(user.uuid),
+      organizationId: user.organizationId ?? null,
+      source: "WEBAPP",
+      auditData: {
+        status: { old: oldBookingStatus, new: BookingStatus.ACCEPTED },
+      },
+      isBookingAuditEnabled,
+    });
+  } catch {
+    // Audit failure must not block the connect-and-join flow
+  }
 
   const locationVideoCallUrl = bookingMetadataSchema.parse(updatedBooking.metadata || {})?.videoCallUrl;
 
